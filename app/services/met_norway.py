@@ -27,10 +27,10 @@ def _symbol_to_wmo(symbol: str | None) -> int | None:
         return 61
     if "fog" in value:
         return 45
-    if "cloudy" in value:
-        return 3
     if "partlycloudy" in value:
         return 2
+    if "cloudy" in value:
+        return 3
     if "fair" in value:
         return 1
     if "clearsky" in value:
