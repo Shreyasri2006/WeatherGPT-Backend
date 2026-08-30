@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import httpx
+
 from app.models.schemas import Location, SourceInfo, WeatherBundle
 from app.services.historical import climate_context
 from app.services.imd import IMDWarningService
+from app.services.met_norway import MetNorwayService
 from app.services.model_agreement import calculate_agreement
 from app.services.open_meteo import OpenMeteoService
 from app.services.risk_engine import assess_risk, derive_alerts
@@ -12,7 +15,17 @@ from app.services.risk_engine import assess_risk, derive_alerts
 
 async def build_weather_bundle(latitude: float, longitude: float, location_name: str = "Selected location", days: int = 7) -> WeatherBundle:
     open_meteo = OpenMeteoService()
-    current, forecast, live_source = await open_meteo.forecast(latitude, longitude, days=days)
+
+    try:
+        current, forecast, live_source = await open_meteo.forecast(latitude, longitude, days=days)
+    except (httpx.HTTPError, RuntimeError):
+        current, forecast, live_source = await MetNorwayService().forecast(
+            latitude,
+            longitude,
+            days=days,
+        )
+
+    # Model comparison is useful context, but must never block the main forecast.
     models = await open_meteo.model_snapshots(latitude, longitude)
     agreement = calculate_agreement(models)
 
@@ -43,7 +56,7 @@ async def build_weather_bundle(latitude: float, longitude: float, location_name:
                 official=False,
                 fetched_at=fetched_at,
                 url="https://open-meteo.com/",
-                note="Used for cross-model agreement in the prototype.",
+                note="Used for cross-model agreement in the prototype. Failure of this optional comparison does not block the main forecast.",
             )
         )
     if official_alerts:
