@@ -8,6 +8,7 @@ import httpx
 
 from app.config import get_settings
 from app.models.schemas import CurrentWeather, DailyForecast, Location, ModelSnapshot, SourceInfo
+from app.services.provider_resilience import TTLCache, request_json_with_retry
 
 
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -15,21 +16,58 @@ GFS_URL = "https://api.open-meteo.com/v1/gfs"
 ECMWF_URL = "https://api.open-meteo.com/v1/ecmwf"
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
+_CACHE = TTLCache()
+
 
 class OpenMeteoService:
     def __init__(self) -> None:
         self.settings = get_settings()
 
-    async def _get(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self.settings.http_timeout_seconds) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
+    @staticmethod
+    def _cache_key(url: str, params: dict[str, Any]) -> str:
+        normalized: list[tuple[str, str]] = []
+        for key, value in sorted(params.items()):
+            if key in {"latitude", "longitude"} and isinstance(value, (int, float)):
+                value = round(float(value), 4)
+            normalized.append((key, str(value)))
+        return f"{url}|{normalized!r}"
+
+    async def _get(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        ttl_seconds: int,
+        stale_seconds: int,
+    ) -> dict[str, Any]:
+        cache_key = self._cache_key(url, params)
+        fresh = await _CACHE.get_fresh(cache_key)
+        if fresh is not None:
+            return fresh
+
+        headers = {
+            "User-Agent": "WeatherGPT-SIH26068/0.1 https://github.com/Shreyasri2006/WeatherGPT-Backend",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.settings.http_timeout_seconds,
+                headers=headers,
+            ) as client:
+                data = await request_json_with_retry(client, url, params, attempts=3)
+            await _CACHE.set(cache_key, data, ttl_seconds=ttl_seconds, stale_seconds=stale_seconds)
+            return data
+        except httpx.HTTPError:
+            stale = await _CACHE.get_stale(cache_key)
+            if stale is not None:
+                return stale
+            raise
 
     async def search_locations(self, query: str, count: int = 7) -> list[Location]:
         data = await self._get(
             GEOCODE_URL,
             {"name": query, "count": count, "language": "en", "format": "json"},
+            ttl_seconds=3600,
+            stale_seconds=86400,
         )
         results = []
         for row in data.get("results", [])[:count]:
@@ -46,8 +84,8 @@ class OpenMeteoService:
 
     async def forecast(self, latitude: float, longitude: float, days: int = 7) -> tuple[CurrentWeather, list[DailyForecast], SourceInfo]:
         params = {
-            "latitude": latitude,
-            "longitude": longitude,
+            "latitude": round(latitude, 4),
+            "longitude": round(longitude, 4),
             "timezone": "auto",
             "forecast_days": min(max(days, 1), 16),
             "current": ",".join(
@@ -77,7 +115,12 @@ class OpenMeteoService:
                 ]
             ),
         }
-        data = await self._get(FORECAST_URL, params)
+        data = await self._get(
+            FORECAST_URL,
+            params,
+            ttl_seconds=300,
+            stale_seconds=1800,
+        )
         current_raw = data.get("current", {})
         current = CurrentWeather(
             temperature_c=current_raw.get("temperature_2m"),
@@ -121,19 +164,24 @@ class OpenMeteoService:
             official=False,
             fetched_at=datetime.now(timezone.utc).isoformat(),
             url="https://open-meteo.com/",
-            note="Prototype live-data source. Replace/augment with IMD-authoritative feeds for production.",
+            note="Primary prototype live-data source with server-side caching and rate-limit protection.",
         )
         return current, forecast, source
 
     async def _model_snapshot(self, url: str, model_name: str, latitude: float, longitude: float) -> ModelSnapshot:
         params = {
-            "latitude": latitude,
-            "longitude": longitude,
+            "latitude": round(latitude, 4),
+            "longitude": round(longitude, 4),
             "timezone": "auto",
             "forecast_days": 2,
             "hourly": "temperature_2m,precipitation,wind_speed_10m",
         }
-        data = await self._get(url, params)
+        data = await self._get(
+            url,
+            params,
+            ttl_seconds=1200,
+            stale_seconds=7200,
+        )
         hourly = data.get("hourly", {})
         precip = [x for x in hourly.get("precipitation", [])[:24] if isinstance(x, (int, float))]
         temp = [x for x in hourly.get("temperature_2m", [])[:24] if isinstance(x, (int, float))]
