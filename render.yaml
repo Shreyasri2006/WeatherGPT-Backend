@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: weathergpt-backend
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: CORS_ORIGINS
+        sync: false
+      - key: HISTORICAL_DATASET_PATH
+        value: data/india_daily_weather.csv
