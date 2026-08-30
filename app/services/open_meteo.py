@@ -8,6 +8,7 @@ import httpx
 
 from app.config import get_settings
 from app.models.schemas import CurrentWeather, DailyForecast, Location, ModelSnapshot, SourceInfo
+from app.services.geocoding_fallback import NominatimGeocodingService
 from app.services.provider_resilience import TTLCache, request_json_with_retry
 
 
@@ -63,24 +64,27 @@ class OpenMeteoService:
             raise
 
     async def search_locations(self, query: str, count: int = 7) -> list[Location]:
-        data = await self._get(
-            GEOCODE_URL,
-            {"name": query, "count": count, "language": "en", "format": "json"},
-            ttl_seconds=3600,
-            stale_seconds=86400,
-        )
-        results = []
-        for row in data.get("results", [])[:count]:
-            results.append(
-                Location(
-                    name=row.get("name", query),
-                    latitude=row["latitude"],
-                    longitude=row["longitude"],
-                    country=row.get("country"),
-                    admin1=row.get("admin1"),
-                )
+        try:
+            data = await self._get(
+                GEOCODE_URL,
+                {"name": query, "count": count, "language": "en", "format": "json"},
+                ttl_seconds=3600,
+                stale_seconds=86400,
             )
-        return results
+            results = []
+            for row in data.get("results", [])[:count]:
+                results.append(
+                    Location(
+                        name=row.get("name", query),
+                        latitude=row["latitude"],
+                        longitude=row["longitude"],
+                        country=row.get("country"),
+                        admin1=row.get("admin1"),
+                    )
+                )
+            return results
+        except httpx.HTTPError:
+            return await NominatimGeocodingService().search_locations(query, count=count)
 
     async def forecast(self, latitude: float, longitude: float, days: int = 7) -> tuple[CurrentWeather, list[DailyForecast], SourceInfo]:
         params = {
